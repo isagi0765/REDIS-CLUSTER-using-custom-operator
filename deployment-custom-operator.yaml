@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-go-client
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-go-client
+  template:
+    metadata:
+      labels:
+        app: redis-go-client
+    spec:
+      containers:
+      - name: redis-go-client
+        image: redis-go-client:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        env:
+        - name: REDIS_ADDR
+          # our operator's headless Service: <RedisCluster name>-headless
+          value: "test-cluster-headless.default.svc.cluster.local:6379"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-go-client
+  namespace: default
+spec:
+  selector:
+    app: redis-go-client
+  ports:
+  - port: 8080
+    targetPort: 8080
