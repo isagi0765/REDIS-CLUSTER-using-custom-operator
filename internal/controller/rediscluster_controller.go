@@ -52,13 +52,14 @@ type RedisClusterReconciler struct {
 
 func labelsFor(name string) map[string]string {
 	return map[string]string{
-		"app":                                  "redis-cluster",
+		"app":                                 "redis-cluster",
 		"redis-cluster.cache.yourorg.io/name": name,
 	}
 }
 
+//go:fix inline
 func nodeInclusionPolicyPtr(p corev1.NodeInclusionPolicy) *corev1.NodeInclusionPolicy {
-	return &p
+	return new(p)
 }
 
 // desiredHeadlessService builds the governing headless Service every

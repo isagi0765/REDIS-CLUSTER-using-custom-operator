@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,7 +96,15 @@ func parseClusterNodes(ctx context.Context, ip string, byIP map[string]*nodeInfo
 	if err != nil {
 		return err
 	}
+	parseClusterNodesText(raw, byIP)
+	return nil
+}
 
+// parseClusterNodesText parses already-fetched CLUSTER NODES text. Split
+// out from parseClusterNodes so a caller that already has the raw text
+// (e.g. assessHealth below) doesn't need a second, redundant round trip
+// to Redis just to parse it -- matters more as cluster size grows.
+func parseClusterNodesText(raw string, byIP map[string]*nodeInfo) {
 	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
@@ -123,22 +132,141 @@ func parseClusterNodes(ctx context.Context, ip string, byIP map[string]*nodeInfo
 		}
 		n.HasSlots = len(fields) >= 9 && fields[8] != ""
 	}
-	return nil
 }
 
-// isBootstrapped reports whether the Redis cluster is already formed, so
-// reconcile stays idempotent and never re-bootstraps a live cluster.
-func isBootstrapped(ctx context.Context, nodes []nodeInfo) bool {
-	for _, n := range nodes {
-		state, err := clusterInfoField(ctx, n.IP, "cluster_state")
-		if err != nil {
+// slotCountFromFields sums the slot ranges/singletons in one CLUSTER NODES
+// line's trailing fields (e.g. "0-5460" or "12182"), skipping migration
+// markers like "[123-<-...]". Used by isClusterViewComplete to verify all
+// 16384 slots are genuinely accounted for in a given view.
+func slotCountFromFields(fields []string) int {
+	total := 0
+	for _, tok := range fields[8:] {
+		if strings.HasPrefix(tok, "[") {
 			continue
 		}
+		if lo, hi, ok := strings.Cut(tok, "-"); ok {
+			l, errL := strconv.Atoi(lo)
+			h, errH := strconv.Atoi(hi)
+			if errL == nil && errH == nil {
+				total += h - l + 1
+			}
+		} else if n, err := strconv.Atoi(tok); err == nil {
+			total += 1
+			_ = n
+		}
+	}
+	return total
+}
+
+// isClusterViewComplete checks ONE pod's own CLUSTER NODES text against
+// three independent conditions, all of which must hold before that pod's
+// view can be trusted: no unresolved ("?") peer address, nobody marked
+// fail/fail?, this pod knows about exactly expectedNodes peers (not just
+// "enough slots assigned" -- a cluster can have all 16384 slots covered
+// while one entire node is still missing from a given pod's gossip view,
+// which is exactly the false "healthy" this closes), and the master lines
+// it does know about collectively own all 16384 slots.
+func isClusterViewComplete(raw string, expectedNodes int) (ok bool, reason string) {
+	if strings.Contains(raw, "?") {
+		return false, "unresolved (?) peer address present"
+	}
+	if strings.Contains(raw, ",fail") {
+		return false, "a node is marked fail/fail?"
+	}
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(lines) != expectedNodes {
+		return false, fmt.Sprintf("knows %d nodes, expected %d", len(lines), expectedNodes)
+	}
+	total := 0
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 && strings.Contains(fields[2], "master") {
+			total += slotCountFromFields(fields)
+		}
+	}
+	if total != totalSlots {
+		return false, fmt.Sprintf("only %d/%d slots assigned", total, totalSlots)
+	}
+	return true, ""
+}
+
+// healthAssessment is the result of cross-checking every pod's own view,
+// not just trusting whichever one answers first.
+type healthAssessment struct {
+	Complete   bool     // true only if some pod's view passed EVERY check
+	RawNodes   string   // the CLUSTER NODES text to parse role data from
+	QueriedPod string   // which pod that text came from, for logging
+	Issues     []string // human-readable reasons, one per pod that disagreed
+}
+
+// assessHealth is the comprehensive replacement for trusting the first pod
+// that happens to answer. It queries EVERY current pod and only reports
+// Complete=true once it finds one whose OWN view passes
+// isClusterViewComplete -- closing a real bug where the operator reported
+// "cluster healthy" with 2 of 3 masters visible, because it trusted
+// whichever pod's exec call happened to succeed first, even though that
+// pod's own gossip hadn't finished re-converging after a host reboot.
+//
+// expectedNodes is passed in (from len(nodes), which itself comes from
+// Spec.Nodes/ReplicasPerNode) rather than hardcoded, so this keeps working
+// correctly if the cluster is scaled to more shards or replicas later.
+//
+// If no pod has a fully complete view yet, Complete is false and RawNodes
+// holds the most-complete PARTIAL view available (by line count) purely so
+// callers can still log something useful -- callers MUST check Complete
+// before trusting the result for status="Ready" or for rebalanceMasters,
+// exactly the mistake that caused the original bug.
+func assessHealth(ctx context.Context, nodes []nodeInfo, expectedNodes int) healthAssessment {
+	var a healthAssessment
+	bestRaw, bestPod, bestScore := "", "", -1
+
+	for _, n := range nodes {
+		c := redisClient(n.IP)
+		raw, err := c.ClusterNodes(ctx).Result()
+		c.Close()
+		if err != nil || raw == "" {
+			a.Issues = append(a.Issues, fmt.Sprintf("%s: unreachable", n.PodName))
+			continue
+		}
+
+		if ok, _ := isClusterViewComplete(raw, expectedNodes); ok {
+			a.Complete = true
+			a.RawNodes = raw
+			a.QueriedPod = n.PodName
+			return a // first fully-agreeing view is enough to trust
+		}
+		_, reason := isClusterViewComplete(raw, expectedNodes)
+		a.Issues = append(a.Issues, fmt.Sprintf("%s: %s", n.PodName, reason))
+
+		if score := strings.Count(raw, "\n"); score > bestScore {
+			bestRaw, bestPod, bestScore = raw, n.PodName, score
+		}
+	}
+
+	a.RawNodes, a.QueriedPod = bestRaw, bestPod
+	return a // Complete stays false
+}
+
+// isBootstrapped answers a narrow, deliberately LOOSE question: has this
+// cluster EVER completed its one-time initial setup? It only gates
+// whether bootstrapCluster (MEET + ADDSLOTSRANGE + REPLICATE) should run.
+//
+// This must NOT be the same check as "is the cluster currently fully
+// healthy" (that's assessHealth above, which is intentionally strict).
+// Conflating the two would be actively dangerous: if a momentarily
+// degraded cluster (e.g. right after a host reboot, before gossip has
+// re-converged) were mistaken for "never bootstrapped", the operator
+// would attempt to re-run CLUSTER ADDSLOTSRANGE against slots that are
+// already owned -- a destructive action, not a safe retry. So this stays
+// permissive: true the moment ANY reachable pod reports owning real
+// slots itself, regardless of whether every other pod currently agrees.
+func isBootstrapped(ctx context.Context, nodes []nodeInfo) bool {
+	for _, n := range nodes {
 		assigned, err := clusterInfoField(ctx, n.IP, "cluster_slots_assigned")
 		if err != nil {
 			continue
 		}
-		if state == "ok" && assigned == fmt.Sprint(totalSlots) {
+		if assigned != "" && assigned != "0" {
 			return true
 		}
 	}
