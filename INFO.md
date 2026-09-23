@@ -210,17 +210,37 @@ hand-built Go client once hung for 25 seconds against a killed master
 because it relied on the OS's default TCP dial timeout instead of a short,
 explicit one.
 
-**`clusterInfoField` / `parseClusterNodes`** — parse Redis's plain-text
-`CLUSTER INFO` and `CLUSTER NODES` output into structured Go data.
-`parseClusterNodes` specifically **skips** any node ID whose IP doesn't
-match a currently-known pod — a deliberate guard against "ghost" entries
-(leftovers from deleted pods) corrupting the live view, a failure mode
-identified earlier while building the Python reconciler for the third-party
-operator.
+**`clusterInfoField` / `parseClusterNodes` / `parseClusterNodesText`** — parse
+Redis's plain-text `CLUSTER INFO` and `CLUSTER NODES` output into structured
+Go data. `parseClusterNodes` fetches and parses in one call;
+`parseClusterNodesText` (split out later — see §6) parses text a caller
+already has, avoiding a redundant round-trip. Both specifically **skip**
+any node ID whose IP doesn't match a currently-known pod — a deliberate
+guard against "ghost" entries (leftovers from deleted pods) corrupting the
+live view, a failure mode identified earlier while building the Python
+reconciler for the third-party operator.
 
-**`isBootstrapped`** — checks `cluster_state:ok` and
-`cluster_slots_assigned:16384` across pods, so bootstrap logic never runs
-twice against an already-healthy cluster.
+**`slotCountFromFields` / `isClusterViewComplete`** — added after a real
+bug (see §6): checks *one* pod's own `CLUSTER NODES` view against three
+conditions — no unresolved `?` addresses, nobody marked `fail`/`fail?`, and
+critically, that the pod knows about exactly as many peers as expected
+(not just "enough slots covered," which turned out to be an insufficient
+check on its own).
+
+**`assessHealth`** — cross-checks *every* current pod's own view, not just
+whichever one answers first, and only reports `Complete: true` once one of
+them passes `isClusterViewComplete` in full. `expectedNodes` is passed in
+from the live pod count (derived from `Spec.Nodes`/`Spec.ReplicasPerNode`),
+not hardcoded, so this keeps working correctly as the cluster is scaled.
+
+**`isBootstrapped`** — answers a narrow, deliberately *loose* question:
+has this cluster ever completed its one-time initial setup? True the
+moment *any* reachable pod reports owning real slots, with no requirement
+that every pod currently agrees. This is intentionally **not** the same
+check as `assessHealth`: conflating "fully healthy right now" with "was
+ever bootstrapped" would risk the operator re-running
+`CLUSTER ADDSLOTSRANGE` against already-owned slots during a momentary
+disagreement — a destructive action, not a safe retry.
 
 **`slotRanges(numMasters)`** — splits the 16,384 hash slots evenly across
 masters, giving any remainder to the last one.
@@ -400,6 +420,7 @@ hypotheticals:
 | `rebalanceMasters` operating on blank data | Real 2-masters-on-one-node imbalance never detected or fixed across many reconcile cycles, no error logged | `rebalanceMasters` was being called on the bare pod-list version of `nodes` (only `PodName`/`K8sNode`/`IP` set) *before* `parseClusterNodes` had ever populated `IsMaster`/`HasSlots`/`NodeID` into that same slice — every `IsMaster` was `false` by Go's zero-value default. Fixed by populating role data in-place before calling the rebalance check. |
 | Leader election timeout | Operator pod stuck retrying `"context deadline exceeded"` against the API server, never started reconciling | Not a code bug — `kube-proxy` was crash-looping cluster-wide from `too many open files`; the host's inotify limits had reverted to OS defaults because an earlier `sudo sysctl` fix was never persisted to `/etc/sysctl.conf`. Fixed by writing the limits permanently and recreating the kind cluster. |
 | Accidentally deleted function header | `apply_fix is not defined` (this one was in the Python reconciler, not Go) | A `str_replace` edit matched text spanning a function boundary and silently dropped the `def apply_fix(...):` line itself, turning its body into dead code nested inside the previous function. Fixed by restoring the header line. |
+| Health check trusted the first pod, not all pods | After a host reboot with 6 pods restarting at different times, the operator reported `"cluster healthy" masters: 2, replicas: 3` — a real master entirely missing from status, with no action taken | The role-population step queried pods in order and stopped at the first one that answered *without erroring* — it never checked whether that pod's own gossip view was actually complete. One pod hadn't finished re-converging and only knew about 5 of 6 real nodes; the operator trusted it anyway. Fixed by replacing the "first responder wins" logic with `assessHealth`, which cross-checks every pod and only trusts a view that passes a full completeness check (right node count, right slot count, no fail flags). `isBootstrapped` was deliberately kept loose rather than also tightened, to avoid a worse failure mode — see §3.2. |
 
 ---
 
