@@ -57,9 +57,8 @@ func labelsFor(name string) map[string]string {
 	}
 }
 
-//go:fix inline
 func nodeInclusionPolicyPtr(p corev1.NodeInclusionPolicy) *corev1.NodeInclusionPolicy {
-	return new(p)
+	return &p
 }
 
 // desiredHeadlessService builds the governing headless Service every
@@ -300,33 +299,29 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// 6. Cluster is formed. Populate real Redis role/pairing data into
-	// `nodes` -- this was the actual bug: rebalanceMasters() was
-	// previously called on the bare pod-list version of `nodes` (only
-	// PodName/K8sNode/IP set), so every IsMaster was false by zero-value
-	// default and the imbalance check silently never triggered, no
-	// matter how unbalanced the real cluster was.
+	// 6. Cluster is formed. Cross-check EVERY pod's own view before
+	// trusting anything -- this replaces the old "stop at the first pod
+	// that answers without erroring" logic, which was the real bug: a
+	// pod could answer successfully while its own gossip was still
+	// incomplete after a restart, and the operator trusted it anyway,
+	// once reporting "healthy" with a whole master missing.
+	assessment := assessHealth(ctx, nodes, len(nodes))
+	if !assessment.Complete {
+		log.Info("cluster view not yet consistent across all pods, will retry",
+			"queriedPod", assessment.QueriedPod, "issues", assessment.Issues)
+		_ = r.setPhase(ctx, &redisCluster, "Degraded", 0, 0)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	byIP := map[string]*nodeInfo{}
 	for i := range nodes {
 		byIP[nodes[i].IP] = &nodes[i]
 	}
-	nodesKnown := false
-	for _, n := range nodes {
-		if err := parseClusterNodes(ctx, n.IP, byIP); err == nil {
-			nodesKnown = true
-			break
-		}
-	}
-	if !nodesKnown {
-		log.Info("could not read cluster state from any pod, will retry")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
+	parseClusterNodesText(assessment.RawNodes, byIP)
 
-	// Before reporting status, check whether a past failover left two
-	// masters on the same K8s node -- planRoles() only ran once, at
-	// bootstrap, so this is the only thing that catches and corrects
-	// drift after a real failure. Confirmed necessary: our own failover
-	// test produced exactly this imbalance.
+	// Only ever act on a view we've confirmed every pod agrees with --
+	// rebalanceMasters must never fire against a partial/stale view,
+	// which could misdiagnose a real imbalance or miss one entirely.
 	if acted, rbErr := rebalanceMasters(ctx, nodes); rbErr != nil {
 		log.Error(rbErr, "master rebalance check failed")
 		// Don't fail the whole reconcile over this -- still report
